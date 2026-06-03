@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,19 @@ from .base import Connector
 ROOT = Path(__file__).resolve().parents[2]
 RECONNECT_MIN_SECONDS = 3
 RECONNECT_MAX_SECONDS = 60
+RECENT_EVENT_TTL_SECONDS = 6 * 60 * 60
+RECENT_EVENT_CACHE_LIMIT = 4096
+IGNORED_BUYER_NAMES = {"工作台通知", "交易消息", "系统消息"}
+IGNORED_BRACKET_TEXT_KEYWORDS = (
+    "卡片消息",
+    "交易成功",
+    "确认收货",
+    "待付款",
+    "已付款",
+    "等待你发货",
+    "已发货",
+    "已收货",
+)
 
 
 class XianyuConnectorUnavailable(RuntimeError):
@@ -55,6 +69,7 @@ class XianyuConnector(Connector):
         self._requested_recent_conversations = False
         self._recent_conversations_mid = ""
         self._history_request_by_mid: dict[str, str] = {}
+        self._recent_event_ids: dict[str, float] = {}
         self._live = None
         self._make_text = None
 
@@ -100,6 +115,26 @@ class XianyuConnector(Connector):
 
     def manual_takeover_enabled(self, conversation_id: str) -> bool:
         return conversation_id in self.manual_takeover_conversations
+
+    def _seen_recent_event(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        now = time.monotonic()
+        if self._recent_event_ids:
+            expired_before = now - RECENT_EVENT_TTL_SECONDS
+            if len(self._recent_event_ids) > RECENT_EVENT_CACHE_LIMIT:
+                self._recent_event_ids = {
+                    key: ts
+                    for key, ts in self._recent_event_ids.items()
+                    if ts >= expired_before
+                }
+            else:
+                for key, ts in tuple(self._recent_event_ids.items()):
+                    if ts < expired_before:
+                        self._recent_event_ids.pop(key, None)
+        seen = message_id in self._recent_event_ids
+        self._recent_event_ids[message_id] = now
+        return seen
 
     async def fetch_listing(self, listing_id: str) -> Listing:
         self._ensure_live()
@@ -157,6 +192,8 @@ class XianyuConnector(Connector):
                 if incoming is None:
                     manual = parse_manual_seller_message(message, self.myid)
                     if manual is not None:
+                        if connector._seen_recent_event(manual.message_id):
+                            return
                         if connector._is_bot_sent_echo(manual.conversation_id, manual.text):
                             return
                         connector.manual_takeover_conversations.add(manual.conversation_id)
@@ -178,6 +215,8 @@ class XianyuConnector(Connector):
                         elif not connector._reported_stale_sync:
                             print(format_stale_sync_summary(message, connector.started_at_ms))
                             connector._reported_stale_sync = True
+                    return
+                if connector._seen_recent_event(incoming.message_id):
                     return
                 print(
                     f"[xianyu <- buyer] conversation={incoming.conversation_id} "
@@ -272,7 +311,10 @@ class XianyuConnector(Connector):
         if not history_events:
             return
         for event in history_events:
+            if self._seen_recent_event(event.message_id):
+                continue
             if isinstance(event, ManualSellerMessage):
+                self.manual_takeover_conversations.add(event.conversation_id)
                 print(
                     f"[xianyu <- seller/history] conversation={event.conversation_id} "
                     f"text={event.text}"
@@ -350,6 +392,33 @@ def parse_manual_seller_message(raw_message: dict[str, Any], myid: str) -> Manua
     return None
 
 
+def stable_message_fallback_id(
+    cid: str,
+    sender_id: str,
+    text: str,
+    *,
+    created_hint: str = "",
+    listing_id: str = "",
+    prefix: str = "",
+) -> str:
+    base = "|".join([cid.strip(), sender_id.strip(), created_hint.strip(), listing_id.strip(), text.strip()])
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+    parts = [part for part in (prefix, cid.strip(), sender_id.strip(), created_hint.strip(), digest) if part]
+    return ":".join(parts)
+
+
+def should_ignore_incoming_message(buyer_name: str, text: str) -> bool:
+    normalized_name = buyer_name.strip()
+    normalized_text = text.strip()
+    if normalized_name in IGNORED_BUYER_NAMES:
+        return True
+    if normalized_text.startswith("[") and normalized_text.endswith("]"):
+        inner = normalized_text[1:-1].strip()
+        if inner and any(keyword in inner for keyword in IGNORED_BRACKET_TEXT_KEYWORDS):
+            return True
+    return False
+
+
 def parse_legacy_reminder(decoded: dict[str, Any], myid: str) -> IncomingMessage | None:
     try:
         body = decoded["1"]["10"]
@@ -364,11 +433,20 @@ def parse_legacy_reminder(decoded: dict[str, Any], myid: str) -> IncomingMessage
     text = str(body.get("reminderContent") or body.get("content") or "").strip()
     if not text:
         return None
+    buyer_name = str(body.get("reminderTitle") or body.get("senderNick") or buyer_id)
+    if should_ignore_incoming_message(buyer_name, text):
+        return None
 
     message_id = (
         str(body.get("messageId") or "")
         or json_field(body.get("extJson"), "messageId")
-        or f"{cid}:{buyer_id}:{abs(hash(text))}"
+        or stable_message_fallback_id(
+            cid,
+            buyer_id,
+            text,
+            created_hint=string_value(find_first(body, ["sendTime", "timeStamp", "timestamp", "createTime"])),
+            listing_id=extract_item_id(str(body.get("reminderUrl") or "")),
+        )
     )
     listing_id = (
         extract_item_id(str(body.get("reminderUrl") or ""))
@@ -379,7 +457,7 @@ def parse_legacy_reminder(decoded: dict[str, Any], myid: str) -> IncomingMessage
     return IncomingMessage(
         conversation_id=cid,
         buyer_id=buyer_id,
-        buyer_name=str(body.get("reminderTitle") or body.get("senderNick") or buyer_id),
+        buyer_name=buyer_name,
         text=text,
         message_id=message_id,
         listing_id=listing_id,
@@ -404,7 +482,14 @@ def parse_legacy_seller_message(decoded: dict[str, Any], myid: str) -> ManualSel
     message_id = (
         str(body.get("messageId") or "")
         or json_field(body.get("extJson"), "messageId")
-        or f"seller:{cid}:{sender_id}:{abs(hash(text))}"
+        or stable_message_fallback_id(
+            cid,
+            sender_id,
+            text,
+            created_hint=string_value(find_first(body, ["sendTime", "timeStamp", "timestamp", "createTime"])),
+            listing_id=extract_item_id(str(body.get("reminderUrl") or "")),
+            prefix="seller",
+        )
     )
     listing_id = (
         extract_item_id(str(body.get("reminderUrl") or ""))
@@ -415,7 +500,7 @@ def parse_legacy_seller_message(decoded: dict[str, Any], myid: str) -> ManualSel
     return ManualSellerMessage(
         conversation_id=cid,
         text=text,
-        message_id=f"seller:{message_id}",
+        message_id=message_id if message_id.startswith("seller:") else f"seller:{message_id}",
         listing_id=listing_id,
     )
 
@@ -455,17 +540,27 @@ def parse_push_message(decoded: dict[str, Any], myid: str) -> IncomingMessage | 
             or json_field(message.get("extJson"), "itemId")
             or ""
         )
-        message_id = (
-            str(message.get("messageId") or "")
-            or json_field(message.get("extJson"), "messageId")
-            or f"{cid}:{buyer_id}:{abs(hash(text))}"
-        )
         buyer_name = str(
             reminder.get("title")
             or sender.get("nick")
             or sender.get("nickname")
             or sender.get("userNick")
             or buyer_id
+        )
+        if should_ignore_incoming_message(buyer_name, text):
+            continue
+        message_id = (
+            str(message.get("messageId") or "")
+            or json_field(message.get("extJson"), "messageId")
+            or stable_message_fallback_id(
+                cid,
+                buyer_id,
+                text,
+                created_hint=string_value(
+                    find_first(message, ["sendTime", "timeStamp", "timestamp", "createTime"])
+                ),
+                listing_id=listing_id,
+            )
         )
         return IncomingMessage(
             conversation_id=cid,
@@ -516,12 +611,21 @@ def parse_push_seller_message(decoded: dict[str, Any], myid: str) -> ManualSelle
         message_id = (
             str(message.get("messageId") or "")
             or json_field(message.get("extJson"), "messageId")
-            or f"{cid}:{sender_id}:{abs(hash(text))}"
+            or stable_message_fallback_id(
+                cid,
+                sender_id,
+                text,
+                created_hint=string_value(
+                    find_first(message, ["sendTime", "timeStamp", "timestamp", "createTime"])
+                ),
+                listing_id=listing_id,
+                prefix="seller",
+            )
         )
         return ManualSellerMessage(
             conversation_id=cid,
             text=text,
-            message_id=f"seller:{message_id}",
+            message_id=message_id if message_id.startswith("seller:") else f"seller:{message_id}",
             listing_id=listing_id,
         )
     return None
@@ -574,12 +678,31 @@ def parse_history_events(
         )
         if not text:
             continue
+        buyer_name = string_value(
+            extension.get("reminderTitle")
+            or extension.get("senderNick")
+            or find_first(message, ["senderNick", "nick"])
+            or buyer_id
+        )
+        if buyer_id != str(myid) and should_ignore_incoming_message(buyer_name, text):
+            continue
 
         message_id = (
             string_value(message.get("messageId"))
             or string_value(extension.get("messageId"))
             or json_field(extension.get("extJson"), "messageId")
-            or f"{cid}:{buyer_id}:{created_ms}:{abs(hash(text))}"
+            or stable_message_fallback_id(
+                str(cid).split("@")[0],
+                buyer_id,
+                text,
+                created_hint=str(created_ms),
+                listing_id=(
+                    extract_item_id(string_value(extension.get("reminderUrl")))
+                    or json_field(extension.get("extJson"), "itemId")
+                    or string_value(find_first(message, ["itemId"]))
+                ),
+                prefix="seller" if buyer_id == str(myid) else "",
+            )
         )
         listing_id = (
             extract_item_id(string_value(extension.get("reminderUrl")))
@@ -594,7 +717,7 @@ def parse_history_events(
                     ManualSellerMessage(
                         conversation_id=str(cid).split("@")[0],
                         text=text,
-                        message_id=f"seller:{message_id}",
+                        message_id=message_id if message_id.startswith("seller:") else f"seller:{message_id}",
                         listing_id=listing_id,
                         created_at=created_at,
                     ),
@@ -608,12 +731,7 @@ def parse_history_events(
                 IncomingMessage(
                     conversation_id=str(cid).split("@")[0],
                     buyer_id=buyer_id,
-                    buyer_name=string_value(
-                        extension.get("reminderTitle")
-                        or extension.get("senderNick")
-                        or find_first(message, ["senderNick", "nick"])
-                        or buyer_id
-                    ),
+                    buyer_name=buyer_name,
                     text=text,
                     message_id=message_id,
                     listing_id=listing_id,

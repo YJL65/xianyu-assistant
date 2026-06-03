@@ -40,12 +40,14 @@ class FeishuNotifier:
         summary: str,
         raw_dialogue: str,
     ) -> dict:
+        unknown = "\u672a\u77e5"
+        unrecognized = "\u672a\u8bc6\u522b"
         text = (
-            "闲鱼服务提醒：有新的咨询需要接手\n\n"
-            f"买家：{buyer_name or '未知'}\n"
-            f"商品：{listing_title or '未识别'}\n\n"
-            f"需求摘要：\n{summary}\n\n"
-            f"对话摘录：\n{raw_dialogue}"
+            "\u95f2\u9c7c\u670d\u52a1\u63d0\u9192\uff1a\u6709\u65b0\u7684\u54a8\u8be2\u9700\u8981\u63a5\u624b\n\n"
+            f"\u4e70\u5bb6\uff1a{buyer_name or unknown}\n"
+            f"\u5546\u54c1\uff1a{listing_title or unrecognized}\n\n"
+            f"\u9700\u6c42\u6458\u8981\uff1a\n{summary}\n\n"
+            f"\u5bf9\u8bdd\u6458\u5f55\uff1a\n{raw_dialogue}"
         )
         return self.send_text(text[:18000])
 
@@ -55,12 +57,15 @@ class FeishuNotifier:
         listing_title: str,
         first_message: str,
     ) -> dict:
+        unknown = "\u672a\u77e5"
+        unrecognized = "\u672a\u8bc6\u522b"
+        empty = "\u7a7a"
         text = (
-            "闲鱼服务提醒：有新的买家咨询\n\n"
-            f"买家：{buyer_name or '未知'}\n"
-            f"商品：{listing_title or '未识别'}\n"
-            f"首条消息：{first_message or '空'}\n\n"
-            "助手会继续回复买家；后续默认不重复通知。"
+            "\u95f2\u9c7c\u670d\u52a1\u63d0\u9192\uff1a\u6709\u65b0\u7684\u4e70\u5bb6\u54a8\u8be2\n\n"
+            f"\u4e70\u5bb6\uff1a{buyer_name or unknown}\n"
+            f"\u5546\u54c1\uff1a{listing_title or unrecognized}\n"
+            f"\u9996\u6761\u6d88\u606f\uff1a{first_message or empty}\n\n"
+            "\u52a9\u624b\u4f1a\u7ee7\u7eed\u56de\u590d\u4e70\u5bb6\uff1b\u540e\u7eed\u9ed8\u8ba4\u4e0d\u91cd\u590d\u901a\u77e5\u3002"
         )
         return self.send_text(text[:4000])
 
@@ -68,16 +73,17 @@ class FeishuNotifier:
         self,
         buyer_name: str,
         listing_title: str,
-        buyer_message: str,
-        assistant_reply: str,
+        dialogue: str,
     ) -> dict:
+        unknown = "\u672a\u77e5"
+        unrecognized = "\u672a\u8bc6\u522b"
+        empty = "\u7a7a"
         text = (
-            "闲鱼服务提醒：新的买家咨询\n\n"
-            f"买家：{buyer_name or '未知'}\n"
-            f"商品：{listing_title or '未识别'}\n\n"
-            "首次对话：\n"
-            f"买家：{buyer_message or '空'}\n"
-            f"模型：{assistant_reply or '空'}"
+            "\u95f2\u9c7c\u670d\u52a1\u63d0\u9192\uff1a\u65b0\u7684\u4e70\u5bb6\u54a8\u8be2\n\n"
+            f"\u4e70\u5bb6\uff1a{buyer_name or unknown}\n"
+            f"\u5546\u54c1\uff1a{listing_title or unrecognized}\n\n"
+            "\u524d\u4e24\u8f6e\u5bf9\u8bdd\uff1a\n"
+            f"{dialogue or empty}"
         )
         return self.send_text(text[:4000])
 

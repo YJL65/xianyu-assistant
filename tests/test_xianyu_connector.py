@@ -1,8 +1,10 @@
 import base64
 import json
 import unittest
+from pathlib import Path
 
 from app.connectors.xianyu import (
+    XianyuConnector,
     content_text,
     decode_sync_data,
     decode_sync_payload,
@@ -16,6 +18,8 @@ from app.connectors.xianyu import (
     parse_incoming_message,
     parse_manual_seller_message,
     prioritize_manual_history_events,
+    should_ignore_incoming_message,
+    stable_message_fallback_id,
 )
 
 
@@ -61,6 +65,78 @@ def pack_msgpack(value):
 
 
 class XianyuConnectorTests(unittest.TestCase):
+    def test_ignores_workbench_card_message(self):
+        decoded = {
+            "pushMessage": {
+                "message": {
+                    "messageId": "msg-card-1",
+                    "senderInfo": {"userId": "buyer-card", "nick": "工作台通知"},
+                    "sessionInfo": {"sessionId": "cid-card@goofish"},
+                    "content": {"contentType": 8},
+                    "reminder": {"title": "工作台通知", "content": "[卡片消息]"},
+                }
+            }
+        }
+        raw = {"body": {"syncPushPackage": {"data": [{"data": json.dumps(decoded, ensure_ascii=False)}]}}}
+
+        self.assertIsNone(parse_incoming_message(raw, "seller-1"))
+
+    def test_ignores_transaction_status_message_in_history(self):
+        response = {
+            "body": {
+                "userMessageModels": [
+                    {
+                        "message": {
+                            "messageId": "msg-transaction-1",
+                            "sendTime": 1780369200000,
+                            "extension": {
+                                "senderUserId": "buyer-1",
+                                "reminderTitle": "交易消息",
+                                "reminderContent": "[买家确认收货，交易成功]",
+                                "reminderUrl": "fleamarket://message_chat?itemId=10001",
+                            },
+                            "content": {"contentType": 1},
+                        }
+                    }
+                ]
+            }
+        }
+
+        events = parse_history_events(response, "cid-1", "seller-1", 1780360000000)
+
+        self.assertEqual(events, [])
+
+    def test_stable_message_fallback_id_is_deterministic(self):
+        first = stable_message_fallback_id(
+            "cid-1",
+            "buyer-1",
+            "你好，在吗",
+            created_hint="1780369200000",
+            listing_id="10001",
+        )
+        second = stable_message_fallback_id(
+            "cid-1",
+            "buyer-1",
+            "你好，在吗",
+            created_hint="1780369200000",
+            listing_id="10001",
+        )
+
+        self.assertEqual(first, second)
+        self.assertIn("1780369200000", first)
+
+    def test_should_ignore_known_system_notifications(self):
+        self.assertTrue(should_ignore_incoming_message("工作台通知", "[卡片消息]"))
+        self.assertTrue(should_ignore_incoming_message("交易消息", "[买家确认收货，交易成功]"))
+        self.assertFalse(should_ignore_incoming_message("猫猫怡哈", "白天有事去了抱歉哈"))
+
+    def test_connector_suppresses_duplicate_event_ids(self):
+        connector = XianyuConnector("unb=1; _m_h5_tk=test_token_1", Path("."))
+
+        self.assertFalse(connector._seen_recent_event("msg-1"))
+        self.assertTrue(connector._seen_recent_event("msg-1"))
+        self.assertFalse(connector._seen_recent_event("msg-2"))
+
     def test_extracts_item_id_from_url(self):
         self.assertEqual(
             extract_item_id("fleamarket://message_chat?itemId=900052644277&peerUserId=1"),

@@ -144,7 +144,7 @@ class AssistantRunner:
         )
         self.store.add_assistant_reply(message.conversation_id, reply, utc_now_iso())
 
-        self._notify_first_ai_exchange(message, listing, reply, state)
+        self._notify_first_ai_exchange(message.conversation_id, message.buyer_name, listing, state)
 
     def _manual_takeover_enabled(self, conversation_id: str) -> bool:
         if self.store.state(conversation_id).manual_takeover:
@@ -157,18 +157,22 @@ class AssistantRunner:
 
     def _notify_first_ai_exchange(
         self,
-        message,
+        conversation_id: str,
+        buyer_name: str,
         listing: Listing,
-        assistant_reply: str,
         state,
     ) -> None:
         if state.initial_notified:
             return
+        history_records = self.store.history_records(conversation_id)
+        history, _is_new_consultation = current_consultation_history(history_records)
+        dialogue = first_two_assistant_rounds(history)
+        if dialogue is None:
+            return
         self.notifier.send_first_ai_exchange(
-            buyer_name=message.buyer_name,
+            buyer_name=buyer_name,
             listing_title=listing.title,
-            buyer_message=message.text,
-            assistant_reply=assistant_reply,
+            dialogue=dialogue,
         )
         state.initial_notified = True
         state.notified = True
@@ -186,7 +190,7 @@ class AssistantRunner:
             FIRST_REPLY,
         )
         self.store.add_assistant_reply(message.conversation_id, FIRST_REPLY, utc_now_iso())
-        self._notify_first_ai_exchange(message, listing, FIRST_REPLY, state)
+        self._notify_first_ai_exchange(message.conversation_id, message.buyer_name, listing, state)
 
     def _customer_service_turn(
         self,
@@ -223,6 +227,20 @@ def format_dialogue(history: list[tuple[str, str]], max_chars: int = 4000) -> st
             label = "助手"
         lines.append(f"{label}: {text}")
     return "\n".join(lines)[-max_chars:]
+
+
+def first_two_assistant_rounds(history: list[tuple[str, str]]) -> str | None:
+    selected: list[tuple[str, str]] = []
+    assistant_count = 0
+    for role, text in history:
+        selected.append((role, text))
+        if role == "assistant":
+            assistant_count += 1
+            if assistant_count >= 2:
+                break
+    if assistant_count < 2:
+        return None
+    return format_dialogue(selected, max_chars=2000)
 
 
 def current_consultation_history(

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.connectors.base import Connector
-from app.models import AssistantDecision, IncomingMessage, Listing, ManualSellerMessage, NeedState
+from app.models import AssistantDecision, IncomingMessage, Listing, ManualSellerMessage, NeedState, utc_now_iso
 from app.runner import AssistantRunner
 
 
@@ -124,9 +124,7 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual(len(connector.sent), 1)
             self.assertEqual(connector.sent[0][2], "你有什么需求？")
-            self.assertEqual(len(notifier.first_exchanges), 1)
-            self.assertEqual(notifier.first_exchanges[0]["buyer_message"], "宝贝还有吗？")
-            self.assertEqual(notifier.first_exchanges[0]["assistant_reply"], "你有什么需求？")
+            self.assertEqual(notifier.first_exchanges, [])
             self.assertEqual(notifier.buyer_messages, [])
             self.assertEqual(notifier.summaries, [])
             self.assertEqual(notifier.customer_summaries, [])
@@ -145,10 +143,14 @@ class RunnerTests(unittest.TestCase):
             )
 
             self.assertEqual(len(notifier.first_exchanges), 1)
-            self.assertEqual(notifier.buyer_messages, [])
             self.assertEqual(len(connector.sent), 2)
             self.assertEqual(connector.sent[1][2], "你有什么需求？")
-
+            exchange = notifier.first_exchanges[0]
+            self.assertEqual(exchange["buyer_name"], "买家A")
+            self.assertIn("宝贝还有吗？", exchange["dialogue"])
+            self.assertIn("我想做一个小程序，明天要", exchange["dialogue"])
+            self.assertIn("你有什么需求？", exchange["dialogue"])
+            self.assertEqual(notifier.buyer_messages, [])
     def test_ai_mode_replies_to_xianyu_and_notifies_first_inquiry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -192,15 +194,9 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(len(connector.sent), 1)
             self.assertEqual(connector.sent[0][2], "有的，你想代问什么内容？截止时间大概是什么时候？")
             self.assertEqual(notifier.new_inquiries, [])
-            self.assertEqual(len(notifier.first_exchanges), 1)
-            self.assertEqual(notifier.first_exchanges[0]["buyer_message"], "宝贝还有吗？")
-            self.assertEqual(
-                notifier.first_exchanges[0]["assistant_reply"],
-                "有的，你想代问什么内容？截止时间大概是什么时候？",
-            )
+            self.assertEqual(notifier.first_exchanges, [])
             self.assertEqual(notifier.buyer_messages, [])
             self.assertEqual(notifier.customer_summaries, [])
-
     def test_ai_mode_only_sends_first_exchange_even_when_need_is_ready(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -244,12 +240,9 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual(len(connector.sent), 1)
             self.assertEqual(connector.sent[0][2], "收到，我先帮你同步给卖家确认。")
-            self.assertEqual(len(notifier.first_exchanges), 1)
-            self.assertEqual(notifier.first_exchanges[0]["buyer_message"], "我要代问Claude，材料都齐，今晚要")
-            self.assertEqual(notifier.first_exchanges[0]["assistant_reply"], "收到，我先帮你同步给卖家确认。")
+            self.assertEqual(notifier.first_exchanges, [])
             self.assertEqual(notifier.customer_summaries, [])
             self.assertEqual(notifier.buyer_messages, [])
-
     def test_ai_mode_keeps_replying_until_manual_takeover(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -285,10 +278,9 @@ class RunnerTests(unittest.TestCase):
                     text="你好，在吗？",
                     message_id="msg-ai-6",
                     listing_id="item-5",
-                    created_at="2026-06-02T00:00:01+00:00",
                 )
             )
-            runner.store.add_assistant_reply("cid-5", "请问您需要处理什么任务？", "2026-06-02T00:00:02+00:00")
+            runner.store.add_assistant_reply("cid-5", "\u8bf7\u95ee\u60a8\u9700\u8981\u5904\u7406\u4ec0\u4e48\u4efb\u52a1\uff1f", utc_now_iso())
 
             asyncio.run(
                 runner.handle_message(
@@ -299,7 +291,6 @@ class RunnerTests(unittest.TestCase):
                         text="我想处理ppt，今天之内完成",
                         message_id="msg-ai-7",
                         listing_id="item-5",
-                        created_at="2026-06-02T00:00:03+00:00",
                     )
                 )
             )
@@ -308,7 +299,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(connector.sent[0][2], "可以的，把参考资料和提示词发我这边就行。")
             self.assertEqual(notifier.customer_summaries, [])
             self.assertEqual(len(notifier.first_exchanges), 1)
-            self.assertEqual(notifier.first_exchanges[0]["buyer_message"], "我想处理ppt，今天之内完成")
+            exchange = notifier.first_exchanges[0]
+            self.assertEqual(exchange["buyer_name"], "买家E")
+            self.assertIn("你好，在吗？", exchange["dialogue"])
+            self.assertIn("我想处理ppt，今天之内完成", exchange["dialogue"])
             self.assertEqual(notifier.buyer_messages, [])
 
     def test_ai_mode_resets_reply_count_after_consultation_gap(self):
@@ -370,8 +364,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(len(connector.sent), 1)
             self.assertEqual(connector.sent[0][2], "在的，请问您这次需要处理什么内容？")
             self.assertEqual(notifier.customer_summaries, [])
-            self.assertEqual(len(notifier.first_exchanges), 1)
-            self.assertEqual(notifier.first_exchanges[0]["buyer_message"], "你好")
+            self.assertEqual(notifier.first_exchanges, [])
             self.assertEqual(notifier.buyer_messages, [])
 
     def test_manual_seller_reply_pauses_ai_replies(self):
