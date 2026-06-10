@@ -144,7 +144,15 @@ class AssistantRunner:
         )
         self.store.add_assistant_reply(message.conversation_id, reply, utc_now_iso())
 
-        self._notify_first_ai_exchange(message.conversation_id, message.buyer_name, listing, state)
+        if decision.should_notify:
+            self._notify_customer_service_summary(
+                conversation_id=message.conversation_id,
+                buyer_name=message.buyer_name,
+                listing=listing,
+                latest_message=message.text,
+                summary=decision.summary,
+                state=state,
+            )
 
     def _manual_takeover_enabled(self, conversation_id: str) -> bool:
         if self.store.state(conversation_id).manual_takeover:
@@ -155,6 +163,30 @@ class AssistantRunner:
         conversations = getattr(self.connector, "manual_takeover_conversations", None)
         return conversation_id in conversations if conversations is not None else False
 
+    def _notify_customer_service_summary(
+        self,
+        conversation_id: str,
+        buyer_name: str,
+        listing: Listing,
+        latest_message: str,
+        summary: str,
+        state: NeedState,
+    ) -> None:
+        if state.notified:
+            return
+        history_records = self.store.history_records(conversation_id)
+        history, _is_new_consultation = current_consultation_history(history_records)
+        self.notifier.send_customer_service_summary(
+            buyer_name=buyer_name,
+            listing_title=listing.title,
+            latest_message=latest_message,
+            summary=summary or fallback_summary_from_history(history),
+            raw_dialogue=format_dialogue(history),
+        )
+        state.completed = True
+        state.initial_notified = True
+        state.notified = True
+
     def _notify_first_ai_exchange(
         self,
         conversation_id: str,
@@ -162,7 +194,7 @@ class AssistantRunner:
         listing: Listing,
         state,
     ) -> None:
-        if state.initial_notified:
+        if state.initial_notified or state.notified:
             return
         history_records = self.store.history_records(conversation_id)
         history, _is_new_consultation = current_consultation_history(history_records)

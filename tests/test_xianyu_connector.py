@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import json
+import time
 import unittest
 from pathlib import Path
 
@@ -13,12 +15,14 @@ from app.connectors.xianyu import (
     extract_listing,
     format_unparsed_sync_push,
     json_field,
+    LISTING_FETCH_TIMEOUT_SECONDS,
     parse_history_messages,
     parse_history_events,
     parse_incoming_message,
     parse_manual_seller_message,
     prioritize_manual_history_events,
     should_ignore_incoming_message,
+    should_silence_sync_push,
     stable_message_fallback_id,
 )
 
@@ -458,6 +462,73 @@ class XianyuConnectorTests(unittest.TestCase):
         self.assertNotIn("旧问题？", text)
         self.assertIn("older unique entries omitted", text)
 
+    def test_silences_builtin_no_bargain_arouse_script(self):
+        payload = {
+            "chatType": 1,
+            "incrementType": 1,
+            "operation": {
+                "content": {
+                    "contentType": 8,
+                    "sessionArouse": {
+                        "sessionArouseInfo": {
+                            "arouseChatScriptId": "noBargain",
+                            "arouseChatScriptInfo": [],
+                        }
+                    },
+                },
+                "sessionInfo": {
+                    "extensions": {"itemTitle": "claude代问", "itemId": "1056754428762"},
+                    "sessionId": "62160092216",
+                },
+            },
+            "sessionId": "62160092216",
+        }
+        raw = {
+            "lwp": "/s/vulcan",
+            "body": {
+                "syncPushPackage": {
+                    "data": [
+                        {"data": base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")}
+                    ],
+                }
+            },
+        }
+
+        self.assertTrue(should_silence_sync_push(raw))
+
+    def test_does_not_silence_regular_session_arouse_suggestions(self):
+        payload = {
+            "chatType": 1,
+            "incrementType": 1,
+            "operation": {
+                "content": {
+                    "contentType": 8,
+                    "sessionArouse": {
+                        "sessionArouseInfo": {
+                            "arouseChatScriptInfo": [{"chatScrip": "单独账号吗？"}],
+                        }
+                    },
+                },
+                "sessionInfo": {
+                    "extensions": {"itemTitle": "Gemini学生认证代订阅", "itemId": "1006624829907"},
+                    "sessionId": "57027900443",
+                },
+            },
+            "sessionId": "57027900443",
+        }
+        raw = {
+            "lwp": "/s/vulcan",
+            "body": {
+                "syncPushPackage": {
+                    "data": [
+                        {"data": base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")}
+                    ],
+                }
+            },
+        }
+
+        self.assertFalse(should_silence_sync_push(raw))
+
     def test_extracts_conversation_ids_from_recent_conversation_response(self):
         response = {
             "body": [
@@ -567,6 +638,42 @@ class XianyuConnectorTests(unittest.TestCase):
         self.assertEqual(prioritized[0].text, "可以的，你发资料。")
         self.assertEqual(prioritized[0].conversation_id, "cid-1")
         self.assertEqual(prioritized[1].text, "现在还能做PPT吗？")
+
+    def test_fetch_listing_uses_cache(self):
+        class FakeApi:
+            def __init__(self):
+                self.calls = 0
+
+            def get_item_info(self, item_id):
+                self.calls += 1
+                return {"data": {"itemDO": {"title": "Demo title", "desc": "Demo desc"}}}
+
+        connector = XianyuConnector("unb=1; _m_h5_tk=test_token_1", Path("."))
+        connector._live = type("FakeLive", (), {"xianyu": FakeApi()})()
+
+        first = asyncio.run(connector.fetch_listing("10001"))
+        second = asyncio.run(connector.fetch_listing("10001"))
+
+        self.assertEqual(connector._live.xianyu.calls, 1)
+        self.assertEqual(first.title, "Demo title")
+        self.assertEqual(second.title, "Demo title")
+
+    def test_fetch_listing_times_out_to_fallback(self):
+        class SlowApi:
+            def get_item_info(self, item_id):
+                time.sleep(LISTING_FETCH_TIMEOUT_SECONDS + 1)
+                return {"data": {"itemDO": {"title": "Too late"}}}
+
+        connector = XianyuConnector("unb=1; _m_h5_tk=test_token_1", Path("."))
+        connector._live = type("FakeLive", (), {"xianyu": SlowApi()})()
+
+        started = time.monotonic()
+        listing = asyncio.run(connector.fetch_listing("10002"))
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, LISTING_FETCH_TIMEOUT_SECONDS + 1.5)
+        self.assertEqual(listing.title, "Item 10002")
+
 
 
 if __name__ == "__main__":

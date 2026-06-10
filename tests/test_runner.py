@@ -197,7 +197,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(notifier.first_exchanges, [])
             self.assertEqual(notifier.buyer_messages, [])
             self.assertEqual(notifier.customer_summaries, [])
-    def test_ai_mode_only_sends_first_exchange_even_when_need_is_ready(self):
+    def test_ai_mode_sends_customer_service_summary_when_need_is_ready(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             settings = Settings(
@@ -241,8 +241,16 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(len(connector.sent), 1)
             self.assertEqual(connector.sent[0][2], "收到，我先帮你同步给卖家确认。")
             self.assertEqual(notifier.first_exchanges, [])
-            self.assertEqual(notifier.customer_summaries, [])
+            self.assertEqual(len(notifier.customer_summaries), 1)
+            summary = notifier.customer_summaries[0]
+            self.assertEqual(summary["buyer_name"], "买家C")
+            self.assertEqual(summary["listing_title"], "服务商品")
+            self.assertEqual(summary["latest_message"], "我要代问Claude，材料都齐，今晚要")
+            self.assertEqual(summary["summary"], "买家需要代问Claude，材料已齐，希望今晚完成。")
+            self.assertIn("我要代问Claude，材料都齐，今晚要", summary["raw_dialogue"])
+            self.assertIn("收到，我先帮你同步给卖家确认。", summary["raw_dialogue"])
             self.assertEqual(notifier.buyer_messages, [])
+            self.assertTrue(runner.store.state("cid-3").notified)
     def test_ai_mode_keeps_replying_until_manual_takeover(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -298,11 +306,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(len(connector.sent), 1)
             self.assertEqual(connector.sent[0][2], "可以的，把参考资料和提示词发我这边就行。")
             self.assertEqual(notifier.customer_summaries, [])
-            self.assertEqual(len(notifier.first_exchanges), 1)
-            exchange = notifier.first_exchanges[0]
-            self.assertEqual(exchange["buyer_name"], "买家E")
-            self.assertIn("你好，在吗？", exchange["dialogue"])
-            self.assertIn("我想处理ppt，今天之内完成", exchange["dialogue"])
+            self.assertEqual(notifier.first_exchanges, [])
             self.assertEqual(notifier.buyer_messages, [])
 
     def test_ai_mode_resets_reply_count_after_consultation_gap(self):

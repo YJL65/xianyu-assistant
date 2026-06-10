@@ -22,6 +22,8 @@ from .base import Connector
 ROOT = Path(__file__).resolve().parents[2]
 RECONNECT_MIN_SECONDS = 3
 RECONNECT_MAX_SECONDS = 60
+LISTING_CACHE_TTL_SECONDS = 10 * 60
+LISTING_FETCH_TIMEOUT_SECONDS = 4
 RECENT_EVENT_TTL_SECONDS = 6 * 60 * 60
 RECENT_EVENT_CACHE_LIMIT = 4096
 IGNORED_BUYER_NAMES = {"工作台通知", "交易消息", "系统消息"}
@@ -62,6 +64,7 @@ class XianyuConnector(Connector):
         self.websocket = None
         self.peer_by_conversation: dict[str, str] = {}
         self.bot_sent_text_by_conversation: dict[str, list[str]] = {}
+        self.listing_cache: dict[str, tuple[float, Listing]] = {}
         self.manual_takeover_conversations: set[str] = set()
         self.started_at_ms = int(time.time() * 1000)
         self.history_since_ms = self.started_at_ms - 24 * 60 * 60 * 1000
@@ -139,12 +142,42 @@ class XianyuConnector(Connector):
     async def fetch_listing(self, listing_id: str) -> Listing:
         self._ensure_live()
         if not listing_id:
-            return Listing(item_id="", title="未识别商品")
+            return Listing(item_id="", title="Unknown listing")
+        cached = self._cached_listing(listing_id)
+        if cached is not None:
+            return cached
         try:
-            data = await asyncio.to_thread(self._live.xianyu.get_item_info, listing_id)
+            data = await asyncio.wait_for(
+                asyncio.to_thread(self._live.xianyu.get_item_info, listing_id),
+                timeout=LISTING_FETCH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"[xianyu] listing fetch timed out for item={listing_id}; "
+                "using cached or fallback title"
+            )
+            return self._cached_listing(listing_id, allow_stale=True) or Listing(
+                item_id=listing_id,
+                title=f"Item {listing_id}",
+            )
         except Exception:
-            return Listing(item_id=listing_id, title=f"商品 {listing_id}")
-        return extract_listing(data, listing_id)
+            return self._cached_listing(listing_id, allow_stale=True) or Listing(
+                item_id=listing_id,
+                title=f"Item {listing_id}",
+            )
+        listing = extract_listing(data, listing_id)
+        self.listing_cache[listing_id] = (time.monotonic(), listing)
+        return listing
+
+    def _cached_listing(self, listing_id: str, allow_stale: bool = False) -> Listing | None:
+        cached = self.listing_cache.get(listing_id)
+        if cached is None:
+            return None
+        cached_at, listing = cached
+        if allow_stale or (time.monotonic() - cached_at) <= LISTING_CACHE_TTL_SECONDS:
+            return listing
+        self.listing_cache.pop(listing_id, None)
+        return None
 
     def _ensure_live(self) -> None:
         if self._live is not None:
@@ -166,7 +199,21 @@ class XianyuConnector(Connector):
                 if getattr(self, "_agent_user_alive_running", False):
                     return
                 self._agent_user_alive_running = True
-                return super().user_alive()
+                retry_seconds = 600
+                try:
+                    while True:
+                        time.sleep(retry_seconds)
+                        try:
+                            self.xianyu.refresh_token()
+                            retry_seconds = 600
+                        except Exception as exc:
+                            print(
+                                f"[xianyu] refresh token failed: {type(exc).__name__}: {exc}; "
+                                "keeping listener alive and retrying in 60s"
+                            )
+                            retry_seconds = 60
+                finally:
+                    self._agent_user_alive_running = False
 
             async def heart_beat(self, websocket):
                 try:
@@ -205,6 +252,8 @@ class XianyuConnector(Connector):
                             await connector.queue.put(manual)
                         return
                     if is_sync_push(message):
+                        if should_silence_sync_push(message):
+                            return
                         write_unparsed_debug(message)
                         text = format_unparsed_sync_push(
                             message,
@@ -1104,6 +1153,23 @@ def write_unparsed_debug(raw_message: dict[str, Any]) -> None:
         )
     except Exception as exc:
         print(f"[xianyu] failed to write unparsed debug snapshot: {exc}")
+
+
+def should_silence_sync_push(raw_message: dict[str, Any]) -> bool:
+    payloads = decode_sync_payloads(raw_message)
+    if not payloads:
+        return False
+    return all(is_ignorable_arouse_script_payload(payload) for payload in payloads)
+
+
+def is_ignorable_arouse_script_payload(decoded: Any) -> bool:
+    if not isinstance(decoded, dict):
+        return False
+    script_id = string_value(find_first(decoded, ["arouseChatScriptId"]))
+    if not script_id:
+        return False
+    content_type = string_value(find_first(decoded, ["contentType"]))
+    return content_type == "8"
 
 
 def write_ws_event_debug(raw_message: dict[str, Any]) -> None:
